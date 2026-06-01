@@ -149,7 +149,7 @@ def fake_tutor_reply(question: str, has_sketch: bool) -> str:
     if question:
         parts.append(f"You asked: *{question[:80]}*")
     if has_sketch:
-        parts.append("I can see your sketch with the coordinate grid.")
+        parts.append("Tutor reply .....")
     return " — ".join(parts) or "(no input received)"
 
 
