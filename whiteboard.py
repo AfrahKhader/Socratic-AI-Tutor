@@ -1,196 +1,174 @@
 """
-Streamlit Whiteboard with Grid-Overlay Export and Combined Text+Sketch Payload
-
-Features added on top of the basic whiteboard:
-- Drawings are exported as PNGs with a coordinate grid burned in.
-- The user's written question + sketch are submitted together as one request
-  to the backend pipeline (single turn).
+Streamlit Notebook Whiteboard
+A scrolling notebook where each conversation turn has its own canvas + text.
 """
 
-from __future__ import annotations  # enables `X | None` type syntax on Python 3.9
+from __future__ import annotations
 
 import streamlit as st
 from streamlit_drawable_canvas import st_canvas
 from PIL import Image, ImageDraw, ImageFont
-import numpy as np
 import io
 import base64
-import json
+from datetime import datetime
 
-# ---------- Page config ----------
-st.set_page_config(page_title="Socratic Tutor — Whiteboard", page_icon="🎨", layout="wide")
-st.title("🎨 Ask with a Sketch")
-st.caption("Type your question and draw a diagram. Both are sent together.")
+# Pillow 10+ compatibility shim for streamlit-drawable-canvas
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
 
-# ---------- Sidebar: drawing controls ----------
+
+st.set_page_config(page_title="Notebook Whiteboard", page_icon="📓", layout="wide")
+
+# ---------- Session state: the notebook ----------
+# Each "page" is one turn: {id, question, sketch_png, tutor_reply, timestamp}
+if "pages" not in st.session_state:
+    st.session_state.pages = []
+if "page_counter" not in st.session_state:
+    st.session_state.page_counter = 0
+if "canvas_key" not in st.session_state:
+    # Bumping this resets the active canvas
+    st.session_state.canvas_key = 0
+
+
+# ---------- Sidebar: tools ----------
 with st.sidebar:
-    st.header("🛠️ Drawing tools")
+    st.header(" Tools")
     drawing_mode = st.selectbox(
-        "Tool", ("freedraw", "line", "rect", "circle", "polygon", "point", "transform")
+        "Tool", ("freedraw", "line", "rect", "circle", "polygon", "transform")
     )
     stroke_width = st.slider("Stroke width", 1, 30, 3)
     stroke_color = st.color_picker("Stroke color", "#000000")
     bg_color = st.color_picker("Background", "#FFFFFF")
-
-    st.divider()
-    st.subheader("📐 Grid (on export)")
     grid_spacing = st.slider("Grid spacing (px)", 20, 200, 50, step=10)
-    grid_color = st.color_picker("Grid color", "#CCCCCC")
-    label_color = st.color_picker("Label color", "#666666")
-    show_grid_preview = st.checkbox("Show grid in preview too", value=False)
 
     st.divider()
-    canvas_width = st.slider("Canvas width", 400, 1200, 800, step=50)
-    canvas_height = st.slider("Canvas height", 300, 900, 500, step=50)
+    if st.button("Clear notebook"):
+        st.session_state.pages = []
+        st.session_state.canvas_key += 1
+        st.rerun()
 
 
-# ---------- Helper: overlay coordinate grid on an RGBA image ----------
-def add_coordinate_grid(
-    img: Image.Image,
-    spacing: int = 50,
-    grid_color: str = "#CCCCCC",
-    label_color: str = "#666666",
-    label_every: int = 1,
-) -> Image.Image:
-    """Burn a coordinate grid onto an image so downstream consumers can
-    reference positions like (120, 80) when discussing the sketch."""
+# ---------- Helper: burn a coordinate grid onto an exported image ----------
+def add_coordinate_grid(img: Image.Image, spacing: int = 50) -> Image.Image:
     out = img.convert("RGBA").copy()
     draw = ImageDraw.Draw(out)
     w, h = out.size
-
-    # Try a real font; fall back to PIL's default if unavailable.
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 10)
     except OSError:
         font = ImageFont.load_default()
-
-    # Vertical lines + x-axis labels along the top
-    for i, x in enumerate(range(0, w, spacing)):
-        draw.line([(x, 0), (x, h)], fill=grid_color, width=1)
-        if i % label_every == 0 and x > 0:
-            draw.text((x + 2, 2), str(x), fill=label_color, font=font)
-
-    # Horizontal lines + y-axis labels along the left
-    for i, y in enumerate(range(0, h, spacing)):
-        draw.line([(0, y), (w, y)], fill=grid_color, width=1)
-        if i % label_every == 0 and y > 0:
-            draw.text((2, y + 2), str(y), fill=label_color, font=font)
-
-    # Origin marker
-    draw.text((2, 2), "0,0", fill=label_color, font=font)
+    for x in range(0, w, spacing):
+        draw.line([(x, 0), (x, h)], fill="#CCCCCC", width=1)
+        if x > 0:
+            draw.text((x + 2, 2), str(x), fill="#666666", font=font)
+    for y in range(0, h, spacing):
+        draw.line([(0, y), (w, y)], fill="#CCCCCC", width=1)
+        if y > 0:
+            draw.text((2, y + 2), str(y), fill="#666666", font=font)
+    draw.text((2, 2), "0,0", fill="#666666", font=font)
     return out
 
 
-# ---------- Layout ----------
-left, right = st.columns([3, 2])
+def png_bytes_from_canvas(image_data) -> bytes | None:
+    """Convert canvas RGBA array → flattened PNG with grid overlay."""
+    if image_data is None:
+        return None
+    img = Image.fromarray(image_data.astype("uint8"), mode="RGBA")
+    flat = Image.new("RGBA", img.size, bg_color)
+    flat.alpha_composite(img)
+    gridded = add_coordinate_grid(flat, spacing=grid_spacing)
+    buf = io.BytesIO()
+    gridded.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
 
-with left:
-    st.subheader("✏️ Sketch")
+
+# ========== MAIN LAYOUT ==========
+
+st.title("Tutor Notebook")
+st.caption("Each entry becomes a page. Scroll up to revisit earlier turns.")
+
+# ---------- Scrollable history (the "notebook") ----------
+# st.container(height=...) gives us a fixed-height, vertically scrollable area.
+history_box = st.container(height=500, border=True)
+
+with history_box:
+    if not st.session_state.pages:
+        st.info("Your notebook is empty. Ask your first question below.")
+    else:
+        for page in st.session_state.pages:
+            with st.container(border=True):
+                cols = st.columns([1, 2])
+                with cols[0]:
+                    st.caption(f"🕐 {page['timestamp']}  ·  Page {page['id']}")
+                    if page["sketch_png"]:
+                        st.image(page["sketch_png"], use_column_width=True)
+                    else:
+                        st.caption("_(no sketch)_")
+                with cols[1]:
+                    st.markdown(f"**You:** {page['question']}")
+                    st.markdown(f"**Tutor:** {page['tutor_reply']}")
+            st.write("")  # spacer
+
+
+st.divider()
+
+# ---------- Active input area: canvas + text ----------
+st.subheader("New entry")
+
+input_cols = st.columns([3, 2])
+
+with input_cols[0]:
     canvas_result = st_canvas(
         fill_color="rgba(255, 165, 0, 0.3)",
         stroke_width=stroke_width,
         stroke_color=stroke_color,
         background_color=bg_color,
         update_streamlit=True,
-        height=canvas_height,
-        width=canvas_width,
+        height=350,
+        width=600,
         drawing_mode=drawing_mode,
-        key="canvas",
+        key=f"canvas_{st.session_state.canvas_key}",
     )
 
-with right:
-    st.subheader("💬 Your question")
+with input_cols[1]:
     question = st.text_area(
-        "Ask anything about your sketch:",
-        placeholder="e.g. 'Why does the force at point (200, 150) push the block to the right?'",
-        height=150,
+        "Your question:",
+        placeholder="Type your question here…",
+        height=200,
+        key=f"question_{st.session_state.canvas_key}",
     )
 
-    submit = st.button("🚀 Submit to tutor", type="primary", use_container_width=True)
-
-
-# ---------- Build the export image with grid ----------
-exported_png_bytes = None
-if canvas_result.image_data is not None:
-    raw_img = Image.fromarray(canvas_result.image_data.astype("uint8"), mode="RGBA")
-    # Flatten transparency onto the chosen background so the grid is visible.
-    flat = Image.new("RGBA", raw_img.size, bg_color)
-    flat.alpha_composite(raw_img)
-
-    gridded = add_coordinate_grid(
-        flat, spacing=grid_spacing, grid_color=grid_color, label_color=label_color
-    )
-
-    buf = io.BytesIO()
-    gridded.convert("RGB").save(buf, format="PNG")
-    exported_png_bytes = buf.getvalue()
-
-    if show_grid_preview:
-        st.subheader("🖼️ Export preview (with grid)")
-        st.image(gridded, use_container_width=True)
-
-
-# ---------- Build the combined payload ----------
-def build_payload(text: str, png_bytes: bytes | None) -> dict:
-    """Bundle the typed question + grid-overlaid sketch into a single
-    request body for the backend pipeline."""
-    payload = {
-        "question": text,
-        "sketch": None,
-    }
-    if png_bytes:
-        payload["sketch"] = {
-            "mime_type": "image/png",
-            "encoding": "base64",
-            "data": base64.b64encode(png_bytes).decode("ascii"),
-            "width": canvas_width,
-            "height": canvas_height,
-            "grid_spacing_px": grid_spacing,
-        }
-    return payload
+    submit = st.button("Add to notebook", type="primary")
 
 
 # ---------- Submit handler ----------
+def fake_tutor_reply(question: str, has_sketch: bool) -> str:
+    """Stand-in for your real backend call."""
+    # Replace this with: requests.post(BACKEND_URL, json=payload).json()["reply"]
+    parts = []
+    if question:
+        parts.append(f"You asked: *{question[:80]}*")
+    if has_sketch:
+        parts.append("I can see your sketch with the coordinate grid.")
+    return " — ".join(parts) or "(no input received)"
+
+
 if submit:
-    if not question.strip() and exported_png_bytes is None:
+    sketch_png = png_bytes_from_canvas(canvas_result.image_data)
+    has_sketch = sketch_png is not None and canvas_result.json_data and \
+                 len(canvas_result.json_data.get("objects", [])) > 0
+
+    if not question.strip() and not has_sketch:
         st.warning("Add a question, a sketch, or both before submitting.")
     else:
-        payload = build_payload(question, exported_png_bytes)
-
-        # --- Replace this block with your real backend call ---
-        # Example:
-        #   import requests
-        #   r = requests.post("https://your-backend/api/ask", json=payload, timeout=60)
-        #   response = r.json()
-        # ------------------------------------------------------
-        st.success("Payload built and ready to send to the backend ✅")
-
-        with st.expander("🔍 Payload preview (what gets sent)"):
-            preview = {
-                "question": payload["question"],
-                "sketch": (
-                    {
-                        **{k: v for k, v in payload["sketch"].items() if k != "data"},
-                        "data": payload["sketch"]["data"][:80] + "... (truncated)",
-                    }
-                    if payload["sketch"]
-                    else None
-                ),
-            }
-            st.json(preview)
-
-        if exported_png_bytes:
-            st.subheader("📤 What the backend sees")
-            st.image(exported_png_bytes, caption="Sketch with coordinate grid")
-
-
-# ---------- Always-available download ----------
-if exported_png_bytes:
-    st.sidebar.divider()
-    st.sidebar.download_button(
-        "⬇️ Download sketch (with grid)",
-        data=exported_png_bytes,
-        file_name="sketch_with_grid.png",
-        mime="image/png",
-        use_container_width=True,
-    )
+        st.session_state.page_counter += 1
+        st.session_state.pages.append({
+            "id": st.session_state.page_counter,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "question": question.strip() or "_(sketch only)_",
+            "sketch_png": sketch_png if has_sketch else None,
+            "tutor_reply": fake_tutor_reply(question, has_sketch),
+        })
+        # Bump canvas key → fresh blank canvas for the next entry
+        st.session_state.canvas_key += 1
+        st.rerun()
